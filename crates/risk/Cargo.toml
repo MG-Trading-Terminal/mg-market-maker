@@ -32,6 +32,7 @@ hex = { workspace = true }
 # yet to keep the retention pipeline compatible with stock
 # tooling.
 flate2 = "1"
+flowtox = "0.1.1"
 
 [dev-dependencies]
 proptest = "1"
