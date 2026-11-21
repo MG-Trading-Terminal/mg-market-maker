@@ -185,6 +185,27 @@ fn on_bvc_bar_produces_same_vpin_shape_as_on_trade() {
 }
 
 #[test]
+fn on_bvc_bar_overflow_keeps_vpin_in_0_1() {
+    // One bar of 1500 one-sided volume into 1000 buckets:
+    // the closed bucket holds 1000, not 1500.
+    let mut vpin = VpinEstimator::new(dec!(1000), 2);
+    vpin.on_bvc_bar(dec!(1500), dec!(0));
+    assert_eq!(vpin.vpin(), Some(dec!(1)));
+}
+
+#[test]
+fn on_trade_overflow_goes_to_the_overflowing_side() {
+    // Buy 600 then sell 600: bucket 1 is 600 buy / 400 sell,
+    // the 200 left over is sell. Pooled carry made it 100/100.
+    let mut vpin = VpinEstimator::new(dec!(1000), 2);
+    vpin.on_trade(&trade("100", "6", Side::Buy));
+    vpin.on_trade(&trade("100", "6", Side::Sell));
+    vpin.on_trade(&trade("100", "8", Side::Sell));
+    // Buckets: |600-400|/1000 = 0.2, |0-1000|/1000 = 1.0.
+    assert_eq!(vpin.vpin(), Some(dec!(0.6)));
+}
+
+#[test]
 fn bvc_classifier_rolling_mean_and_std_accessors() {
     let mut b = BvcClassifier::new(dec!(0.25), 10);
     for i in 1..=5 {

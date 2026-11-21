@@ -12,16 +12,10 @@ use tracing::warn;
 ///
 /// When VPIN > threshold, the MM should widen spreads or pause quoting.
 pub struct VpinEstimator {
-    /// Volume bucket size (in quote terms).
-    bucket_size: Decimal,
+    /// Exact volume bucketing (overflow split at the bucket edge).
+    inner: flowtox::Vpin,
     /// Number of buckets to keep in the window.
     num_buckets: usize,
-    /// Current bucket: accumulated buy/sell volume.
-    current_buy_vol: Decimal,
-    current_sell_vol: Decimal,
-    current_total_vol: Decimal,
-    /// Completed buckets: (|buy - sell|, total) pairs.
-    buckets: VecDeque<(Decimal, Decimal)>,
 }
 
 impl VpinEstimator {
@@ -30,68 +24,30 @@ impl VpinEstimator {
     /// - `bucket_size`: volume (in quote asset) per bucket. Typical: daily_volume / 50.
     /// - `num_buckets`: window size. Typical: 50.
     pub fn new(bucket_size: Decimal, num_buckets: usize) -> Self {
-        Self {
-            bucket_size,
-            num_buckets,
-            current_buy_vol: dec!(0),
-            current_sell_vol: dec!(0),
-            current_total_vol: dec!(0),
-            buckets: VecDeque::with_capacity(num_buckets),
-        }
+        let inner = flowtox::Vpin::new(bucket_size.to_f64().unwrap_or(0.0), num_buckets.max(1))
+            .expect("VPIN bucket_size must be positive");
+        Self { inner, num_buckets }
     }
 
     /// Feed a trade into the VPIN calculator.
     pub fn on_trade(&mut self, trade: &Trade) {
-        let vol = trade.price * trade.qty;
-        match trade.taker_side {
-            Side::Buy => self.current_buy_vol += vol,
-            Side::Sell => self.current_sell_vol += vol,
-        }
-        self.current_total_vol += vol;
-
-        // If bucket is full, finalize it. The bucket's imbalance
-        // must be computed on the portion of volume attributed
-        // to THIS bucket (= bucket_size), not on the full
-        // current_total_vol — otherwise a single trade that
-        // overflows multiple buckets would record an imbalance
-        // > bucket_size and violate the mathematical bound
-        // |buy - sell| ≤ buy + sell, driving vpin() > 1.
-        // Property-based test `vpin_is_bounded_in_0_1` caught
-        // this latent bug.
-        while self.current_total_vol >= self.bucket_size {
-            let buy_ratio = if self.current_total_vol > dec!(0) {
-                self.current_buy_vol / self.current_total_vol
-            } else {
-                dec!(0.5)
-            };
-            let bucket_buy = self.bucket_size * buy_ratio;
-            let bucket_sell = self.bucket_size - bucket_buy;
-            let imbalance = (bucket_buy - bucket_sell).abs();
-            self.buckets.push_back((imbalance, self.bucket_size));
-            if self.buckets.len() > self.num_buckets {
-                self.buckets.pop_front();
-            }
-
-            // Carry overflow into next bucket using the same ratio.
-            let overflow = self.current_total_vol - self.bucket_size;
-            self.current_buy_vol = overflow * buy_ratio;
-            self.current_sell_vol = overflow - self.current_buy_vol;
-            self.current_total_vol = overflow;
-        }
+        let vol = (trade.price * trade.qty).to_f64().unwrap_or(0.0);
+        let side = match trade.taker_side {
+            Side::Buy => flowtox::Side::Buy,
+            Side::Sell => flowtox::Side::Sell,
+        };
+        self.inner.update_side(side, vol);
     }
 
     /// Get current VPIN value [0, 1].
     /// 0 = balanced flow, 1 = completely one-sided (toxic).
     pub fn vpin(&self) -> Option<Decimal> {
-        if self.buckets.len() < self.num_buckets / 2 {
+        let n = self.inner.bucket_imbalances().count();
+        if n == 0 || n < self.num_buckets / 2 {
             return None; // Not enough data.
         }
-        let sum_imbalance: Decimal = self.buckets.iter().map(|(imb, _)| *imb).sum();
-        let sum_volume: Decimal = self.buckets.iter().map(|(_, vol)| *vol).sum();
-        if sum_volume.is_zero() {
-            return None;
-        }
-        Some(sum_imbalance / sum_volume)
+        let sum: f64 = self.inner.bucket_imbalances().sum();
+        Decimal::from_f64(sum / n as f64)
     }
 
     /// Check if flow is toxic (above threshold).
@@ -112,30 +68,10 @@ impl VpinEstimator {
     /// `vpin()` output shape — only the classification step
     /// upstream differs.
     pub fn on_bvc_bar(&mut self, buy_vol: Decimal, sell_vol: Decimal) {
-        let total = buy_vol + sell_vol;
-        self.current_buy_vol += buy_vol;
-        self.current_sell_vol += sell_vol;
-        self.current_total_vol += total;
-
-        while self.current_total_vol >= self.bucket_size {
-            let overflow = self.current_total_vol - self.bucket_size;
-            let imbalance = (self.current_buy_vol - self.current_sell_vol).abs();
-            self.buckets.push_back((imbalance, self.bucket_size));
-            if self.buckets.len() > self.num_buckets {
-                self.buckets.pop_front();
-            }
-            // Carry overflow into next bucket, proportionally
-            // to the current buy/sell split.
-            if self.current_total_vol > dec!(0) {
-                let buy_ratio = self.current_buy_vol / self.current_total_vol;
-                self.current_buy_vol = overflow * buy_ratio;
-                self.current_sell_vol = overflow * (dec!(1) - buy_ratio);
-            } else {
-                self.current_buy_vol = dec!(0);
-                self.current_sell_vol = dec!(0);
-            }
-            self.current_total_vol = overflow;
-        }
+        self.inner.update_classified(
+            buy_vol.to_f64().unwrap_or(0.0),
+            sell_vol.to_f64().unwrap_or(0.0),
+        );
     }
 }
 
